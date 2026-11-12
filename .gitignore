@@ -1,0 +1,6 @@
+*.xlsx
+*.xls
+*.json
+!manifest.webmanifest
+私密*/
+screenshots/

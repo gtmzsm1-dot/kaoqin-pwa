@@ -5,12 +5,13 @@ import { readRosterSheet, planImport, writeRosterTemplate } from './core/roster.
 import { buildStats, sheet1Aoa, writeMonthlyWorkbook, writeAllDataWorkbook, precheck, consumeLabel } from './core/export.js';
 import { makeBackup, readBackup } from './core/backup.js';
 import { fmtJie, fmtNum, keshi, isHalfStep } from './core/jie.js';
+import { matchStudent } from './core/pinyin.js';
 import { dayOf, fmtDay, monthRange, isDay } from './core/dates.js';
 import * as db from './db.js';
 import { makePinRecord, checkPin, isValidPin } from './pin.js';
 import { esc, sheet, confirmDlg, alertDlg, promptDlg, toast, pinPad, askPin } from './ui.js';
 
-export const APP_VERSION = '1.0.0';
+export const APP_VERSION = '1.0.1';
 const AUTO_LOCK_MS = 3 * 60 * 1000;
 const XLSX_ACCEPT = '.xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel';
 const $app = document.getElementById('app');
@@ -143,7 +144,6 @@ VIEWS.course = ({ id }) => {
   const studs = S.store.students({ includeInactive: S.draft._all });
   const q = S.draft._q ?? '';
   const sel = new Set(c.studentIds);
-  const shown = studs.filter((s) => !q || s.name.includes(q) || (s.code ?? '').includes(q) || (s.grade ?? '').includes(q));
   const chosen = c.studentIds.map((sid) => st().students[sid]).filter(Boolean);
   return `${top(id ? '修改课程' : '新建课程', { back: 'courses' })}<div class="page" id="course-form">
   <div class="grid2"><label class="field"><span>校区</span><input class="input" id="c-campus" value="${esc(c.campus)}" placeholder="如 曲江校区"></label>
@@ -156,12 +156,17 @@ VIEWS.course = ({ id }) => {
   <div class="section">已选学生 ${chosen.length} 人${c.mode === '一对一' ? '（一对一只能选 1 人）' : ''}</div>
   <div class="chips">${chosen.map((s) => `<button class="chip on" data-act="toggle-stu" data-id="${s.id}">${esc(s.name)} ✕</button>`).join('') || '<span class="hint">从下面勾选</span>'}</div>
   <div class="section">从名单里选</div>
-  <div class="grid2"><input class="input" id="c-q" placeholder="搜姓名/编号/年级" value="${esc(q)}"><button class="btn" data-act="course-all">${S.draft._all ? '只看在读' : '显示全部（含停课）'}</button></div>
-  <div class="list pick">${shown.slice(0, 300).map((s) => `<label class="row"><input type="checkbox" data-act="toggle-stu" data-id="${s.id}" ${sel.has(s.id) ? 'checked' : ''}><div class="main"><div class="t">${esc(s.name)}</div><div class="s">${esc([s.grade, s.school, s.code, s.status !== '在读' ? s.status : ''].filter(Boolean).join(' · '))}</div></div></label>`).join('') || '<div class="empty">名单里没有匹配的学生</div>'}</div>
-  ${shown.length > 300 ? '<p class="hint">只显示前 300 人，请用搜索缩小范围。</p>' : ''}
+  <div class="grid2"><input class="input" id="c-q" type="search" autocomplete="off" placeholder="搜姓名/拼音首字母/编号" value="${esc(q)}"><button class="btn" data-act="course-all">${S.draft._all ? '只看在读' : '显示全部（含停课）'}</button></div>
+  <p class="hint">只能选学生总名单里已有的学生；名单里没有的，请先把他加进总名单 Excel 再导入。</p>
+  <div id="pick-list">${coursePickHtml(studs, q, sel)}</div>
   ${id ? `<button class="btn mt" data-act="archive-course" data-id="${id}">${st().courses[id].archived ? '恢复使用' : '停用这门课程'}</button>` : ''}
   </div><div class="fab-wrap"><button class="btn primary big" id="btn-save-course" data-act="save-course">保存课程</button></div>`;
 };
+function coursePickHtml(studs, q, sel) {
+  const shown = studs.filter((s) => matchStudent(s, q));
+  return `<div class="list pick">${shown.slice(0, 300).map((s) => `<label class="row"><input type="checkbox" data-act="toggle-stu" data-id="${s.id}" ${sel.has(s.id) ? 'checked' : ''}><div class="main"><div class="t">${esc(s.name)}</div><div class="s">${esc([s.grade, s.school, s.code, s.status !== '在读' ? s.status : ''].filter(Boolean).join(' · '))}</div></div></label>`).join('') || '<div class="empty">名单里没有匹配的学生</div>'}</div>
+  ${shown.length > 300 ? '<p class="hint">只显示前 300 人，请用搜索缩小范围。</p>' : ''}`;
+}
 function readCourseForm() {
   const g = (i) => document.getElementById(i)?.value ?? '';
   Object.assign(S.draft, { campus: g('c-campus'), grade: g('c-grade'), subject: g('c-subject'), teacher: g('c-teacher'), name: g('c-name'), defaultJie: Number(g('c-jie')) });
@@ -187,7 +192,7 @@ VIEWS.roll = () => {
     <div class="seg3">${[ATT.present, ATT.leave, ATT.absent].map((s) => `<button data-act="set-status" data-i="${i}" data-s="${s}" class="${r.status === s ? 'on' : ''}">${s}</button>`).join('')}</div>
     <div class="stepper ${r.status !== ATT.present ? 'hidden' : ''}"><button data-act="jie" data-i="${i}" data-d="-0.5">−</button><span class="num">${fmtNum(r.jie)}</span><button data-act="jie" data-i="${i}" data-d="0.5">＋</button></div>
   </div>`).join('') || '<div class="empty">这门课程还没有学生，请到「课程模板」里添加</div>'}</div>
-  <button class="btn ghost" data-act="roll-add-stu">＋ 临时加一个学生（从名单选）</button>
+  <p class="hint">只能签课程里的学生。要加人，请到「课程模板」从总名单里选。</p>
   <label class="field"><span>备注（可不填）</span><input class="input" id="r-note" value="${esc(d.note)}" placeholder="如 调课、补课"></label>
   </div><div class="fab-wrap"><div class="sum" id="roll-sum">到课 ${n} 人 · 请假 ${d.records.filter((r) => r.status === ATT.leave).length} · 缺勤 ${d.records.filter((r) => r.status === ATT.absent).length} · 共 ${fmtNum(sum)} 节</div>
   <button class="btn primary big" id="btn-save-roll" data-act="save-roll">${d.editId ? '保存修改' : '完成签课'}</button></div>`;
@@ -246,21 +251,26 @@ VIEWS.sessions = ({ month = thisMonth() }) => {
 
 // ---------- 学生名单 ----------
 VIEWS.students = ({ all = false, q = '' }) => {
-  const list = S.store.students({ includeInactive: all }).filter((s) => !q || s.name.includes(q) || (s.code ?? '').includes(q) || (s.grade ?? '').includes(q) || (s.manager ?? '').includes(q));
-  return `${top('学生名单', { back: 'menu', right: '<button class="iconbtn back" data-act="edit-stu">新增</button>' })}<div class="page">
-  <div class="grid2"><input class="input" id="stu-q" placeholder="搜姓名/编号/年级/学管" value="${esc(q)}"><button class="btn" data-act="stu-all">${all ? '只看在读' : '显示全部（含停课）'}</button></div>
-  <p class="hint">${all ? '全部' : '在读'} ${list.length} 人</p>
-  <div class="list">${list.slice(0, 400).map((s) => `<button class="row" data-act="edit-stu" data-id="${s.id}"><div class="main"><div class="t">${esc(s.name)}${s.status !== '在读' ? ` <span class="tag">${esc(s.status)}</span>` : ''}</div><div class="s">${esc([s.code, s.grade, s.school, s.manager].filter(Boolean).join(' · '))}</div></div></button>`).join('') || '<div class="empty">没有学生，请先导入名单</div>'}</div>
+  return `${top('学生名单', { back: 'menu' })}<div class="page">
+  <div class="grid2"><input class="input" id="stu-q" type="search" autocomplete="off" placeholder="搜姓名/拼音首字母/编号" value="${esc(q)}"><button class="btn" data-act="stu-all">${all ? '只看在读' : '显示全部（含停课）'}</button></div>
+  <div id="stu-list">${stuListHtml(all, q)}</div>
+  <p class="hint">新学生请先加进「学生总名单」Excel，再「导入名单」合并；这里只能修改已有学生。</p>
   <button class="btn ghost" data-go="import">导入 / 合并名单 Excel</button></div>`;
 };
+function stuListHtml(all, q) {
+  const list = S.store.students({ includeInactive: all }).filter((s) => matchStudent(s, q));
+  return `<p class="hint">${all ? '全部' : '在读'} ${list.length} 人</p>
+  <div class="list">${list.slice(0, 400).map((s) => `<button class="row" data-act="edit-stu" data-id="${s.id}"><div class="main"><div class="t">${esc(s.name)}${s.status !== '在读' ? ` <span class="tag">${esc(s.status)}</span>` : ''}</div><div class="s">${esc([s.code, s.grade, s.school, s.manager].filter(Boolean).join(' · '))}</div></div></button>`).join('') || '<div class="empty">名单里没有匹配的学生</div>'}</div>`;
+}
 async function editStudent(id) {
-  const s = id ? st().students[id] : { name: '', code: '待补', school: '', grade: '', cohort: '', status: '在读', manager: '' };
+  if (!id || !st().students[id]) return alertDlg('请从总名单导入', '新学生必须先加进「学生总名单」Excel，再「导入名单」。');
+  const s = st().students[id];
   const f = (k, label) => `<label class="field"><span>${label}</span><input class="input" data-k="${k}" value="${esc(s[k] ?? '')}"></label>`;
   const v = await sheet({ title: id ? '修改学生' : '新增学生', html: `${f('name', '姓名')}${f('code', '学生编号（没有写 待补）')}<div class="grid2">${f('grade', '年级')}${f('school', '学校')}</div>
     <div class="grid2">${f('cohort', '届别')}${f('manager', '负责学管')}</div><label class="field"><span>状态</span><select class="input" data-k="status">${[...new Set([...STATUS_LIST, s.status])].map((x) => `<option ${x === s.status ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></label>`,
     buttons: [{ label: '保存', kind: 'primary', value: (w) => Object.fromEntries([...w.querySelectorAll('[data-k]')].map((e) => [e.dataset.k, e.value])) }, { label: '取消', value: null }] });
   if (!v) return;
-  try { id ? S.store.editStudent(id, v) : S.store.addStudent(v); await flush(); toast('已保存'); render(); } catch (e) { alertDlg('没有保存', e.message); }
+  try { S.store.editStudent(id, v); await flush(); toast('已保存'); render(); } catch (e) { alertDlg('没有保存', e.message); }
 }
 
 // ---------- 导入名单 ----------
@@ -416,15 +426,6 @@ document.addEventListener('click', async (e) => {
       case 'start-roll': S.draft = newRollDraft(st().courses[id]); return go('roll');
       case 'set-status': { const r = S.draft.records[+b.dataset.i]; r.status = b.dataset.s; if (r.status === ATT.present && !r.jie) r.jie = st().courses[S.draft.courseId].defaultJie; return keepRoll(); }
       case 'jie': { const r = S.draft.records[+b.dataset.i]; const n = Math.round((r.jie + Number(b.dataset.d)) * 2) / 2; if (n >= 0.5 && n <= 10) r.jie = n; return keepRoll(); }
-      case 'roll-add-stu': {
-        const have = new Set(S.draft.records.map((r) => r.studentId));
-        const nm = await promptDlg('输入学生姓名（须在名单里）', { placeholder: '姓名' });
-        if (!nm) return;
-        const hits = Object.values(st().students).filter((s) => s.name === nm.trim() && !have.has(s.id));
-        if (!hits.length) return alertDlg('名单里没有', `没找到「${nm}」。请先在「学生名单」里新增，或检查名字。`);
-        S.draft.records.push({ studentId: hits[0].id, status: ATT.present, jie: st().courses[S.draft.courseId].defaultJie });
-        return keepRoll();
-      }
       case 'save-roll': return saveRoll();
       case 'edit-session': { const s = st().sessions[id]; S.draft = { courseId: s.courseId, date: s.date, note: s.note ?? '', editId: id, records: s.records.map((r) => ({ ...r, jie: r.status === ATT.present ? r.jie : st().courses[s.courseId]?.defaultJie ?? 1 })) }; return go('roll'); }
       case 'del-session': {
@@ -507,11 +508,27 @@ document.addEventListener('click', (e) => {
   const m = e.target.closest('#c-mode button'); if (!m) return;
   readCourseForm(); S.draft.mode = m.dataset.mode; if (S.draft.mode === '一对一') S.draft.studentIds = S.draft.studentIds.slice(0, 1); keepScroll();
 });
-let qTimer = null;
+// 实时搜索：中文输入法选字期间（composition）不搜索、不重绘；只重绘结果列表，输入框节点和内容保持不变
+let qTimer = null, composing = false;
+function runSearch(t) {
+  if (t.id === 'c-q' && S.draft) {
+    S.draft._q = t.value;
+    const el = document.getElementById('pick-list');
+    if (el) el.innerHTML = coursePickHtml(S.store.students({ includeInactive: S.draft._all }), t.value, new Set(S.draft.studentIds));
+  } else if (t.id === 'stu-q') {
+    S.view.q = t.value;
+    const el = document.getElementById('stu-list');
+    if (el) el.innerHTML = stuListHtml(!!S.view.all, t.value);
+  }
+}
+const isSearch = (t) => t && (t.id === 'c-q' || t.id === 'stu-q');
+document.addEventListener('compositionstart', (e) => { if (isSearch(e.target)) { composing = true; clearTimeout(qTimer); } });
+document.addEventListener('compositionend', (e) => { if (isSearch(e.target)) { composing = false; const t = e.target; clearTimeout(qTimer); qTimer = setTimeout(() => runSearch(t), 0); } });
 document.addEventListener('input', (e) => {
   const t = e.target;
-  if (t.id === 'c-q') { clearTimeout(qTimer); qTimer = setTimeout(() => { readCourseForm(); S.draft._q = t.value; keepScroll(); const el = document.getElementById('c-q'); el?.focus(); el?.setSelectionRange(el.value.length, el.value.length); }, 300); }
-  if (t.id === 'stu-q') { clearTimeout(qTimer); qTimer = setTimeout(() => { S.view.q = t.value; render(); const el = document.getElementById('stu-q'); el?.focus(); el?.setSelectionRange(el.value.length, el.value.length); }, 300); }
+  if (!isSearch(t)) return;
+  if (composing || e.isComposing) return;
+  clearTimeout(qTimer); qTimer = setTimeout(() => runSearch(t), 150);
 });
 
 boot().catch((e) => { $app.innerHTML = `<div class="boot">打开失败：${esc(e?.message ?? e)}<br>请换 Safari 打开，或联系管理员。</div>`; });

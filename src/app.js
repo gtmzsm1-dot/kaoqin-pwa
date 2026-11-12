@@ -2,7 +2,7 @@
 import * as XLSX from '../vendor/xlsx.mjs';
 import { Store, ATT, MODES, STATUS_LIST, KIND_LABEL, courseLabel, presentCount, totalJie } from './core/store.js';
 import { readRosterSheet, planImport, writeRosterTemplate } from './core/roster.js';
-import { buildStats, sheet1Aoa, writeMonthlyWorkbook, writeAllDataWorkbook, precheck, consumeLabel } from './core/export.js';
+import { buildStats, layoutSheet, writeMonthlyWorkbook, writeAllDataWorkbook, precheck, consumeLabel, EXPORT_FORMATS } from './core/export.js';
 import { makeBackup, readBackup } from './core/backup.js';
 import { fmtJie, fmtNum, keshi, isHalfStep } from './core/jie.js';
 import { matchStudent } from './core/pinyin.js';
@@ -11,7 +11,7 @@ import * as db from './db.js';
 import { makePinRecord, checkPin, isValidPin } from './pin.js';
 import { esc, sheet, confirmDlg, alertDlg, promptDlg, toast, pinPad, askPin } from './ui.js';
 
-export const APP_VERSION = '1.0.1';
+export const APP_VERSION = '1.0.2';
 const AUTO_LOCK_MS = 3 * 60 * 1000;
 const XLSX_ACCEPT = '.xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel';
 const $app = document.getElementById('app');
@@ -307,33 +307,37 @@ async function onImportFile(file) {
 }
 
 // ---------- 月底导出 ----------
-VIEWS.export = ({ month = prevMonthDefault(), campus = '' }) => {
+VIEWS.export = ({ month = prevMonthDefault(), campus = '', format = st().settings.exportFormat ?? 'weiduo' }) => {
   const { from, to } = monthRange(month);
   const { issues, stats } = precheck(st(), { from, to, campus });
-  const { aoa } = sheet1Aoa(stats);
+  const L = layoutSheet(stats, format);
+  const aoa = L.aoa.slice(L.headerRow);
+  const cols = format === 'jing' ? [0, 1, 2, 3, 4, 7] : [0, 1, 2, 3, 4, 5];
   const campuses = [...new Set(Object.values(st().courses).map((c) => c.campus).filter(Boolean))];
   const locked = S.store.isLocked(month);
   return `${top('月底导出', { back: 'menu' })}<div class="page" id="export">
   <div class="grid2"><label class="field"><span>月份</span><input class="input" type="month" id="e-month" value="${month}"></label>
   <label class="field"><span>校区</span><select class="input" id="e-campus"><option value="">全部校区</option>${campuses.map((x) => `<option ${x === campus ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></label></div>
+  <label class="field"><span>表格格式</span><select class="input" id="e-format">${Object.entries(EXPORT_FORMATS).map(([k, v]) => `<option value="${k}" ${k === format ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
   <div class="card"><div class="grid3"><div><div class="k">签课</div><div class="v">${stats.sessions.length} 次</div></div><div><div class="k">学生行</div><div class="v">${stats.studentRows}</div></div><div><div class="k">合计</div><div class="v">${fmtJie(stats.totalJie)}</div></div></div>
   <p class="hint">${locked ? '🔒 本月已锁账' : '导出后会锁定本月，再改要输密码'}</p></div>
   <div class="section">导出前自检</div>
   <div id="precheck">${issues.length ? `<div class="list">${issues.map((i) => `<button class="row warn" data-go="session" data-id="${i.sessionId}"><div class="main"><div class="t wrap"><b>${esc(i.type)}</b>　${esc(i.text)}</div><div class="s">${esc(i.where)}</div></div><span class="chev">›</span></button>`).join('')}</div>`
     : '<div class="card ok-card" id="precheck-ok">✓ 没发现问题：无 0 人到课、无节数异常、学生都在名单里</div>'}</div>
-  <div class="section">预览（与「课时统计」表 Sheet1 同格式，单价和总价留空）</div>
-  <div class="tbl-wrap"><table id="export-preview"><thead><tr>${aoa[0].slice(0, 6).map((h) => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>
-  ${aoa.slice(1).map((r) => `<tr>${r.slice(0, 6).map((v) => `<td>${esc(v)}</td>`).join('')}</tr>`).join('') || '<tr><td colspan="6">这个月没有签课</td></tr>'}</tbody></table></div>
+  <div class="section">预览（${esc(EXPORT_FORMATS[format])}；单价、总价留空${L.title ? '；第 1 行标题「' + esc(L.title) + '」' : ''}）</div>
+  <div class="tbl-wrap"><table id="export-preview"><thead><tr>${cols.map((i) => `<th>${esc(aoa[0][i])}</th>`).join('')}</tr></thead><tbody>
+  ${aoa.slice(1).map((r) => `<tr>${cols.map((i) => `<td>${esc(r[i])}</td>`).join('')}</tr>`).join('') || '<tr><td colspan="6">这个月没有签课</td></tr>'}</tbody></table></div>
   </div><div class="fab-wrap"><button class="btn primary big" id="btn-export" data-act="do-export" ${stats.sessions.length ? '' : 'disabled'}>导出 Excel${issues.length ? `（有 ${issues.length} 条提醒）` : ''}</button></div>`;
 };
 const prevMonthDefault = () => (new Date().getDate() <= 10 ? prevMonth() : thisMonth());
 async function doExport() {
-  const month = S.view.month ?? prevMonthDefault(), campus = S.view.campus ?? '';
+  const month = S.view.month ?? prevMonthDefault(), campus = S.view.campus ?? '', format = S.view.format ?? st().settings.exportFormat ?? 'weiduo';
   const { from, to } = monthRange(month);
   const { issues, stats } = precheck(st(), { from, to, campus });
   if (issues.length && !(await confirmDlg(`自检有 ${issues.length} 条提醒`, issues.slice(0, 6).map((i) => `· ${i.where}：${i.text}`).join('\n') + (issues.length > 6 ? '\n……' : '') + '\n\n建议先点开逐条核对。仍要导出吗？', '仍导出'))) return;
-  const name = `${campus ? campus : ''}${month.slice(0, 4)}年${+month.slice(5)}月课时统计.xlsx`;
-  await saveFile(writeMonthlyWorkbook(XLSX, st(), stats), name, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  const org = st().settings.org ?? '';
+  const name = format === 'jing' ? `${org}${campus}${month.replace('-', '')}课时费表.xlsx` : `${org}${campus}${month.slice(0, 4)}年${+month.slice(5)}月课时统计.xlsx`;
+  await saveFile(writeMonthlyWorkbook(XLSX, st(), stats, { format }), name, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   if (!S.store.isLocked(month)) { S.store.lockMonth(month, '导出课时统计表后自动锁定'); await flush(); toast(`已导出，${+month.slice(5)}月已锁账`); }
   else toast('已导出');
   render();
@@ -381,6 +385,7 @@ VIEWS.settings = () => {
   const lm = st().settings.lockedMonths ?? [];
   return `${top('设置', { back: 'menu' })}<div class="page"><div class="list">
   <button class="row" data-act="set-campus"><div class="main"><div class="t">本机默认校区</div><div class="s">${esc(st().settings.campus || '未设置')}（新建课程时自动带入）</div></div></button>
+  <button class="row" data-act="set-org"><div class="main"><div class="t">机构名称（导出文件名前缀）</div><div class="s">${esc(st().settings.org || '未设置')}，例如填「维多」导出为「维多2026年11月课时统计.xlsx」</div></div></button>
   <button class="row" data-act="change-pin"><div class="main"><div class="t">修改密码</div></div></button></div>
   <div class="section">已锁账的月份</div><div class="list">${lm.map((m) => `<div class="row"><div class="main"><div class="t">${m}</div></div><button class="btn small" data-act="unlock-month" data-m="${m}">解锁</button></div>`).join('') || '<div class="empty">暂无</div>'}</div>
   <p class="hint">存储永久保留：${S.persisted === true ? '已获准' : S.persisted === false ? '未获准（请定期备份）' : '未知'}。页面禁止任何外部连接，数据不离开手机。</p></div>`;
@@ -478,6 +483,7 @@ document.addEventListener('click', async (e) => {
         return replaceAll(s.state, s.ops, '已恢复到快照');
       }
       case 'set-campus': { const v = await promptDlg('本机默认校区', { value: st().settings.campus ?? '' }); if (v == null) return; S.store.setSettings({ campus: v.trim() }); await flush(); return render(); }
+      case 'set-org': { const v = await promptDlg('机构名称', { value: st().settings.org ?? '' }); if (v == null) return; S.store.setSettings({ org: v.trim() }); await flush(); return render(); }
       case 'unlock-month': { if (!(await pinCheck(`解锁 ${b.dataset.m}`))) return; S.store.unlockMonth(b.dataset.m); await flush(); toast('已解锁'); return render(); }
       case 'change-pin': {
         if (!(await pinCheck('先输入当前密码'))) return;
@@ -499,8 +505,9 @@ document.addEventListener('change', (e) => {
   if (t.id === 'f-import' && t.files?.[0]) onImportFile(t.files[0]);
   else if (t.id === 'f-restore' && t.files?.[0]) onRestoreFile(t.files[0]);
   else if (t.id === 's-month' && t.value) go('sessions', { month: t.value });
-  else if (t.id === 'e-month' && t.value) go('export', { month: t.value, campus: S.view.campus ?? '' });
-  else if (t.id === 'e-campus') go('export', { month: S.view.month ?? prevMonthDefault(), campus: t.value });
+  else if (t.id === 'e-month' && t.value) go('export', { month: t.value, campus: S.view.campus ?? '', format: S.view.format });
+  else if (t.id === 'e-campus') go('export', { month: S.view.month ?? prevMonthDefault(), campus: t.value, format: S.view.format });
+  else if (t.id === 'e-format') { if (st().settings.exportFormat !== t.value) S.store.setSettings({ exportFormat: t.value }); go('export', { month: S.view.month ?? prevMonthDefault(), campus: S.view.campus ?? '', format: t.value }); }
   else if (t.id === 'r-date' && S.draft) { S.draft.date = t.value; keepRoll(); }
   else if (t.matches?.('#c-mode button')) {}
 });

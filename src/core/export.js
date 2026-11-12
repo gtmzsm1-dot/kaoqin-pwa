@@ -1,6 +1,7 @@
 // 月度导出：Sheet1 与现有「课时统计」同版式；另附「明细」页（一行 = 一个学生的一次上课，全数值列、不合并）
 import { ATT, courseLabel, STATUS_LIST } from './store.js';
 import { fmtJie, keshi, roundHalf } from './jie.js';
+import { writeStyledXlsx } from './xlsxw.js';
 
 export const SHEET1_HEADER = (label) => ['教师姓名', '所带学生', '年级', '班型', label, '课次', '消课单价', '消课总价', '课时费单价', '教师课时费', '合计', '备注', '人工核对'];
 export const DETAIL_HEADER = ['日期', '校区', '教师', '年级', '班型', '科目', '课程', '学生', '学生编号', '出勤', '节数', '课时数', '备注'];
@@ -36,31 +37,12 @@ export function buildStats(state, { from, to, campus = '' }) {
     const rows = order.map((id) => ({ student: state.students[id], jie: roundHalf(jie.get(id)) }));
     const t = course.teacher || '（未填教师）';
     if (!teachers.has(t)) teachers.set(t, []);
-    teachers.get(t).push({ course, rows, hist: sessionHistogram(list), sessions: list.length });
+    teachers.get(t).push({ course, rows, hist: sessionHistogram(list), sessions: list.length, first: list[0].date + list[0].createdAt });
   }
   const groups = [...teachers.entries()].sort((a, b) => zh(a[0], b[0]))
-    .map(([teacher, courses]) => ({ teacher, courses: courses.sort((a, b) => zh(a.course.grade, b.course.grade) || zh(a.course.mode, b.course.mode) || zh(courseLabel(a.course), courseLabel(b.course))) }));
+    .map(([teacher, courses]) => ({ teacher, courses: courses.sort((a, b) => (a.course.mode === '一对一') - (b.course.mode === '一对一') || a.first.localeCompare(b.first) || zh(courseLabel(a.course), courseLabel(b.course))) }));
   const totalJie = groups.reduce((a, g) => a + g.courses.reduce((b, c) => b + c.rows.reduce((x, r) => x + r.jie, 0), 0), 0);
   return { from, to, campus, sessions, groups, totalJie, studentRows: groups.reduce((a, g) => a + g.courses.reduce((b, c) => b + c.rows.length, 0), 0) };
-}
-
-/** Sheet1 的二维数组与合并区域 */
-export function sheet1Aoa(stats) {
-  const aoa = [SHEET1_HEADER(consumeLabel(stats.from, stats.to))];
-  const merges = [];
-  for (const g of stats.groups) {
-    const tStart = aoa.length;
-    for (const c of g.courses) {
-      const cStart = aoa.length;
-      c.rows.forEach((r, i) => {
-        aoa.push([aoa.length === tStart ? g.teacher : '', r.student?.name ?? '（已删除学生）', i === 0 ? c.course.grade : '', i === 0 ? c.course.mode : '',
-          fmtJie(r.jie), c.hist[i] ?? '', '', '', '', '', '', '', '']);
-      });
-      if (c.rows.length > 1) for (const col of [2, 3]) merges.push({ s: { r: cStart, c: col }, e: { r: aoa.length - 1, c: col } });
-    }
-    if (aoa.length - tStart > 1) merges.push({ s: { r: tStart, c: 0 }, e: { r: aoa.length - 1, c: 0 } });
-  }
-  return { aoa, merges };
 }
 
 export function detailAoa(state, stats) {
@@ -75,18 +57,72 @@ export function detailAoa(state, stats) {
   return aoa;
 }
 
-export function writeMonthlyWorkbook(XLSX, state, stats) {
-  const wb = XLSX.utils.book_new();
-  const { aoa, merges } = sheet1Aoa(stats);
-  const ws = XLSX.utils.aoa_to_sheet(aoa);
-  ws['!merges'] = merges;
-  ws['!cols'] = [10.17, 10.17, 7.33, 7.33, 11.33, 8.33, 10.17, 10.17, 12.83, 12.83, 8.33, 16.17, 23.17].map((wch) => ({ wch }));
-  XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
-  const det = XLSX.utils.aoa_to_sheet(detailAoa(state, stats));
-  for (let r = 1; ; r++) { const a = det[XLSX.utils.encode_cell({ r, c: 0 })]; if (!a) break; a.t = 'd'; a.v = new Date(a.v + 'T00:00:00Z'); a.z = 'yyyy-mm-dd'; delete a.w; }
-  det['!cols'] = [11, 8, 10, 7, 7, 7, 26, 10, 13, 6, 6, 7, 16].map((wch) => ({ wch }));
-  XLSX.utils.book_append_sheet(wb, det, '明细');
-  return XLSX.write(wb, { type: 'array', bookType: 'xlsx', cellDates: true });
+// 样式照原表：「课时统计」Sheet1（默认）与「(精)课时费表」
+const F11 = { name: '宋体', sz: 11 };
+const ST = {
+  wdHead: { font: { name: '宋体', sz: 12 }, fill: 'FF4874CB', border: 'thin', h: 'center', v: 'center' },
+  wdCell: { font: F11, border: 'thin', h: 'center', v: 'center' },
+  wdNum: { font: F11, border: 'thin', h: 'center', v: 'center', numFmt: '#,##0.00' },
+  wdCheck: { font: { name: '宋体', sz: 10 }, border: 'thin', h: 'center', v: 'center' },
+  jHead: { font: F11, fill: 'FFFFC000', border: 'thin', h: 'center', v: 'center' },
+  jCell: { font: F11, border: 'thin', h: 'center', v: 'center' },
+  jNum: { font: F11, border: 'thin', h: 'center', v: 'center', numFmt: '#,##0.00;[Red]\\(#,##0.00\\);\\-' },
+  dHead: { font: { name: '宋体', sz: 11, b: true }, fill: 'FFD9E1F2', border: 'thin', h: 'center', v: 'center' },
+  dCell: { font: F11, border: 'thin', v: 'center' },
+  dDate: { font: F11, border: 'thin', v: 'center', numFmt: 'yyyy-mm-dd' },
+};
+export const EXPORT_FORMATS = { weiduo: '课时统计表（默认，同 10 月课时统计 Sheet1）', jing: '(精)课时费表格式' };
+const encodeMerge = (r1, c1, r2, c2) => `${String.fromCharCode(65 + c1)}${r1 + 1}:${String.fromCharCode(65 + c2)}${r2 + 1}`;
+
+/** 二维数组 + 合并（按格式） */
+export function layoutSheet(stats, format = 'weiduo') {
+  const label = consumeLabel(stats.from, stats.to);
+  const jing = format === 'jing';
+  const header = jing ? ['教师姓名', '所带学生', '年级', '班型', label, '消课单价', '消课总价', '课次', '课时费单价', '教师课时费', '合计', '备注', '备注'] : SHEET1_HEADER(label);
+  const aoa = [];
+  const ym = stats.from.slice(0, 4) + stats.from.slice(5, 7);
+  if (jing) aoa.push([`${ym}课时费表`, ...Array(12).fill('')]);
+  const top = aoa.length;
+  aoa.push(header);
+  const merges = jing ? ['A1:M1'] : [];
+  for (const g of stats.groups) {
+    const tStart = aoa.length;
+    for (const c of g.courses) {
+      const cStart = aoa.length;
+      c.rows.forEach((r, i) => {
+        const base = [aoa.length === tStart ? g.teacher : '', r.student?.name ?? '（已删除学生）', i === 0 ? c.course.grade : '', i === 0 ? c.course.mode : '', fmtJie(r.jie)];
+        aoa.push(jing ? [...base, '', '', c.hist[i] ?? '', '', '', '', '', ''] : [...base, c.hist[i] ?? '', '', '', '', '', '', '', '']);
+      });
+      if (c.rows.length > 1) for (const col of [2, 3]) merges.push(encodeMerge(cStart, col, aoa.length - 1, col));
+    }
+    if (aoa.length - tStart > 1) { merges.push(encodeMerge(tStart, 0, aoa.length - 1, 0)); if (jing) merges.push(encodeMerge(tStart, 10, aoa.length - 1, 10)); }
+  }
+  return { aoa, merges, headerRow: top, title: jing ? `${ym}课时费表` : null, sheetName: jing ? ym : 'Sheet1' };
+}
+/** 兼容旧接口（Sheet1 默认格式，合并为对象） */
+export function sheet1Aoa(stats) {
+  const { aoa, merges } = layoutSheet(stats, 'weiduo');
+  const dec = (m) => { const [a, b] = m.split(':'); const p = (x) => ({ c: x.charCodeAt(0) - 65, r: +x.slice(1) - 1 }); return { s: p(a), e: p(b) }; };
+  return { aoa, merges: merges.map(dec) };
+}
+
+export function writeMonthlyWorkbook(_XLSX, state, stats, { format = 'weiduo' } = {}) {
+  const L = layoutSheet(stats, format);
+  const jing = format === 'jing';
+  const numCols = jing ? new Set([5, 6, 8, 9, 10]) : new Set([6, 7]);
+  const rows = L.aoa.map((r, ri) => r.map((v, ci) => {
+    if (ri <= L.headerRow) return { v, s: jing ? ST.jHead : ST.wdHead };
+    if (!jing && ci === 12) return { v, s: ST.wdCheck };
+    return { v, s: numCols.has(ci) ? (jing ? ST.jNum : ST.wdNum) : (jing ? ST.jCell : ST.wdCell) };
+  }));
+  const cols = jing
+    ? [[1, 2, 10.3076923076923], [3, 3, 8.15384615384615], [4, 4, 20], [5, 5, 12.3846153846154], [6, 7, 10.3076923076923], [8, 8, 9], [9, 10, 12.7692307692308], [11, 11, 9.61538461538461], [12, 12, 9.15384615384615], [13, 13, 6]]
+    : [[1, 2, 11], [3, 4, 8.15384615384615], [5, 5, 12.2307692307692], [6, 6, 9.23076923076923], [7, 8, 11], [9, 10, 13.6153846153846], [11, 11, 9.23076923076923], [12, 12, 17], [13, 13, 24]];
+  const main = { name: L.sheetName, rows, merges: L.merges, cols: cols.map(([min, max, width]) => ({ min, max, width })), heights: jing ? {} : { 1: 17.6 }, defaultRowHeight: 16.8, fitWidth: true };
+  const det = detailAoa(state, stats);
+  const detRows = det.map((r, ri) => r.map((v, ci) => (ri === 0 ? { v, s: ST.dHead } : ci === 0 ? { v: new Date(v + 'T00:00:00Z'), s: ST.dDate } : { v, s: ST.dCell })));
+  const detail = { name: '明细', rows: detRows, cols: [11, 8, 10, 7, 7, 7, 26, 10, 13, 6, 6, 7, 16].map((w, i) => ({ min: i + 1, max: i + 1, width: w })) };
+  return writeStyledXlsx([main, detail]);
 }
 
 /** 全部数据 Excel（随完整备份一起导出，便于人工查看；恢复以 JSON 为准） */

@@ -1,4 +1,4 @@
-// 月度导出：Sheet1 与现有「课时统计」同版式；另附「明细」页（一行 = 一个学生的一次上课，全数值列、不合并）
+// 月度导出：只有 Sheet1 一页，与现有「课时统计」同版式。明细（一行 = 一个学生的一次上课）只在数据备份 Excel 里
 import { ATT, courseLabel, STATUS_LIST, sessionTeacher } from './store.js';
 import { fmtJie, keshi, roundHalf } from './jie.js';
 import { writeStyledXlsx } from './xlsxw.js';
@@ -126,15 +126,18 @@ export function writeMonthlyWorkbook(_XLSX, state, stats, { format = 'weiduo' } 
     ? [[1, 2, 10.3076923076923], [3, 3, 8.15384615384615], [4, 4, 20], [5, 5, 12.3846153846154], [6, 7, 10.3076923076923], [8, 8, 9], [9, 10, 12.7692307692308], [11, 11, 9.61538461538461], [12, 12, 9.15384615384615], [13, 13, 6]]
     : [[1, 2, 11], [3, 4, 8.15384615384615], [5, 5, 12.2307692307692], [6, 6, 9.23076923076923], [7, 8, 11], [9, 10, 13.6153846153846], [11, 11, 9.23076923076923], [12, 12, 17], [13, 13, 24]];
   const main = { name: L.sheetName, rows, merges: L.merges, cols: cols.map(([min, max, width]) => ({ min, max, width })), heights: jing ? {} : { 1: 17.6 }, defaultRowHeight: 16.8, fitWidth: true };
-  const det = detailAoa(state, stats);
-  const detRows = det.map((r, ri) => r.map((v, ci) => (ri === 0 ? { v, s: ST.dHead } : ci === 0 ? { v: new Date(v + 'T00:00:00Z'), s: ST.dDate } : { v, s: ST.dCell })));
-  const detail = { name: '明细', rows: detRows, cols: [11, 8, 10, 7, 7, 7, 26, 10, 13, 6, 6, 7, 6, 10, 16].map((w, i) => ({ min: i + 1, max: i + 1, width: w })) };
-  return writeStyledXlsx([main, detail]);
+  // V2.0.1：月度课时统计表只有这一页（同原表 Sheet1），不再附「明细」页；明细只在「设置 → 数据备份（非统计表）」
+  return writeStyledXlsx([main]);
 }
+
+/** 文件名：表名用作文件名（原表没有标题行，导出也不加） */
+export const monthlyFileName = (org, campus, month) => `${org ?? ''}${campus ?? ''}${month.slice(0, 4)}年${+month.slice(5, 7)}月课时统计.xlsx`;
+export const dataBackupFileName = (day) => `签课数据备份（非统计表）-${day}.xlsx`;
 
 /** 全部数据 Excel（随完整备份一起导出，便于人工查看；恢复以 JSON 为准） */
 export function writeAllDataWorkbook(XLSX, state) {
   const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([['这是签课 App 的数据备份（非统计表）'], ['内容：学生名单、课程、签课明细，只给人查看。'], ['月度课时统计表请在 App 菜单 →「导出月度课时统计表」导出。'], ['换手机恢复数据请用「备份与恢复」里的 JSON 完整备份。']]), '说明（非统计表）');
   const stu = [['序号', '姓名', '学生编号', '学校', '年级', '届别', '状态', '负责学管', '备注']];
   for (const s of Object.values(state.students).sort((a, b) => (STATUS_LIST.indexOf(a.status) - STATUS_LIST.indexOf(b.status)) || (a.seq ?? 1e9) - (b.seq ?? 1e9) || zh(a.name, b.name)))
     stu.push([s.seq ?? '', s.name, s.code, s.school, s.grade, s.cohort, s.status, s.manager, s.note ?? '']);

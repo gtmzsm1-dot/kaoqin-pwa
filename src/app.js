@@ -3,7 +3,7 @@ import * as XLSX from '../vendor/xlsx.mjs';
 import { Store, ATT, MODES, STATUS_LIST, KIND_LABEL, courseLabel, presentCount, totalJie, migrate, SESSION_TAGS, sessionTeacher } from './core/store.js';
 import { teacherSummary, studentSummary, absenceStreaks, streakKey } from './core/query.js';
 import { readRosterSheet, planImport, writeRosterTemplate } from './core/roster.js';
-import { buildStats, layoutSheet, writeMonthlyWorkbook, writeAllDataWorkbook, precheck, consumeLabel, EXPORT_FORMATS } from './core/export.js';
+import { buildStats, layoutSheet, writeMonthlyWorkbook, writeAllDataWorkbook, precheck, consumeLabel, monthlyFileName, dataBackupFileName } from './core/export.js';
 import { makeBackup, readBackup } from './core/backup.js';
 import { fmtJie, fmtNum, keshi, isHalfStep } from './core/jie.js';
 import { matchStudent } from './core/pinyin.js';
@@ -12,7 +12,9 @@ import * as db from './db.js';
 import { makePinRecord, checkPin, isValidPin } from './pin.js';
 import { esc, sheet, confirmDlg, alertDlg, promptDlg, toast, pinPad, askPin } from './ui.js';
 
-export const APP_VERSION = '2.0.0';
+export const APP_VERSION = '2.0.1';
+export const EXPORT_LABEL = '导出月度课时统计表';
+export const DATA_XLSX_LABEL = '数据备份（非统计表）';
 const AUTO_LOCK_MS = 3 * 60 * 1000;
 const XLSX_ACCEPT = '.xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel';
 const $app = document.getElementById('app');
@@ -30,7 +32,18 @@ const fmtTime = (iso) => { const d = new Date(iso); return `${dayOf(d)} ${String
 
 // ---------- 启动 ----------
 async function boot() {
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+  if ('serviceWorker' in navigator) {
+    // 新版本：SW 接管后会自己刷新页面；若系统不支持，则刚打开不久（还在输密码）就刷新一次，已在使用中则提示点「更新」
+    const hadController = !!navigator.serviceWorker.controller, t0 = Date.now();
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController) return;
+      setTimeout(() => {
+        if (Date.now() - t0 < 30000 && !S.unlocked) location.reload();
+        else toast('已有新版本，点「更新」生效', { label: '更新', run: () => location.reload() });
+      }, 1500);
+    });
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  }
   try { S.persisted = navigator.storage?.persisted ? await navigator.storage.persisted() : null;
     if (S.persisted === false && navigator.storage?.persist) S.persisted = await navigator.storage.persist(); } catch { S.persisted = null; }
   S.lastExport = await db.kvGet('lastBackup').catch(() => null);
@@ -124,6 +137,7 @@ VIEWS.home = () => {
     <div class="section">课程（点一下就签课）</div>${list}
     <div class="section">今天已签 ${todayS.length} 次</div>
     ${todayS.length ? `<div class="list">${todayS.map(sessRow).join('')}</div>` : '<div class="empty">今天还没签课</div>'}
+    ${Object.keys(st().sessions).length ? `<div class="section">月底</div><button class="btn" id="home-export" data-go="export">${EXPORT_LABEL}</button>` : ''}
   </div>
   <div class="fab-wrap"><button class="btn primary big" id="btn-roll" data-act="pick-course">签课</button></div>`;
 };
@@ -141,7 +155,7 @@ const leaveAbsText = (s) => { const l = s.records.filter((r) => r.status === ATT
 VIEWS.menu = () => `${top('菜单', { back: 'home' })}<div class="page"><div class="list menu">
   ${[['sessions', '签课记录', '按月份查看、修改'], ['students', '学生名单', `${S.store.students().length} 人在读`], ['import', '导入名单', '从 Excel 导入或合并'], ['courses', '课程模板', `${S.store.courses().length} 门`],
     ['byTeacher', '按老师查课时', '本月每位老师上了多少节'], ['byStudent', '按学生查次数', '到课、请假、缺勤次数'],
-    ['export', '月底导出课时统计表', '导出前自检，导出后锁账'], ['backup', '备份与恢复', S.lastExport ? '上次备份 ' + fmtTime(S.lastExport) : '还没备份过'], ['log', '操作记录', `${S.store.ops.length} 条`],
+    ['export', EXPORT_LABEL, '和原「课时统计」表同格式；导出前自检，导出后锁账'], ['backup', '备份与恢复', S.lastExport ? '上次备份 ' + fmtTime(S.lastExport) : '还没备份过'], ['log', '操作记录', `${S.store.ops.length} 条`],
     ['help', '使用教程', '一页看懂'], ['settings', '设置', '校区、密码、锁账月份']]
     .map(([v, t, s]) => `<button class="row" data-go="${v}" id="m-${v}"><div class="main"><div class="t">${t}</div><div class="s">${esc(s)}</div></div><span class="chev">›</span></button>`).join('')}
   </div><p class="hint">版本 ${APP_VERSION} · 数据只存在这台手机，不上传。</p></div>`;
@@ -323,37 +337,38 @@ async function onImportFile(file) {
 }
 
 // ---------- 月底导出 ----------
-VIEWS.export = ({ month = prevMonthDefault(), campus = '', format = st().settings.exportFormat ?? 'weiduo' }) => {
+// 主界面导出只出月度课时统计表（原表 Sheet1 格式，单 sheet）。明细数据 Excel 只在「设置 → 数据备份（非统计表）」
+VIEWS.export = ({ month = prevMonthDefault(), campus = '' }) => {
+  const format = 'weiduo';
   const { from, to } = monthRange(month);
   const { issues, stats } = precheck(st(), { from, to, campus });
   const L = layoutSheet(stats, format);
   const aoa = L.aoa.slice(L.headerRow);
-  const cols = format === 'jing' ? [0, 1, 2, 3, 4, 7] : [0, 1, 2, 3, 4, 5];
+  const cols = [0, 1, 2, 3, 4, 5];
   const campuses = [...new Set(Object.values(st().courses).map((c) => c.campus).filter(Boolean))];
   const locked = S.store.isLocked(month);
-  return `${top('月底导出', { back: 'menu' })}<div class="page" id="export">
+  return `${top(EXPORT_LABEL, { back: 'menu' })}<div class="page" id="export">
   <div class="grid2"><label class="field"><span>月份</span><input class="input" type="month" id="e-month" value="${month}"></label>
   <label class="field"><span>校区</span><select class="input" id="e-campus"><option value="">全部校区</option>${campuses.map((x) => `<option ${x === campus ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select></label></div>
-  <label class="field"><span>表格格式</span><select class="input" id="e-format">${Object.entries(EXPORT_FORMATS).map(([k, v]) => `<option value="${k}" ${k === format ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
   <div class="card"><div class="grid3"><div><div class="k">签课</div><div class="v">${stats.sessions.length} 次</div></div><div><div class="k">学生行</div><div class="v">${stats.studentRows}</div></div><div><div class="k">合计</div><div class="v">${fmtJie(stats.totalJie)}</div></div></div>
   <p class="hint">${locked ? '🔒 本月已锁账' : '导出后会锁定本月，再改要输密码'}</p></div>
   <div class="section">导出前自检</div>
   <div id="precheck">${issues.length ? `<div class="list">${issues.map((i) => `<button class="row warn" data-go="session" data-id="${i.sessionId}"><div class="main"><div class="t wrap"><b>${esc(i.type)}</b>　${esc(i.text)}</div><div class="s">${esc(i.where)}</div></div><span class="chev">›</span></button>`).join('')}</div>`
     : '<div class="card ok-card" id="precheck-ok">✓ 没发现问题：无 0 人到课、无节数异常、学生都在名单里</div>'}</div>
-  <div class="section">预览（${esc(EXPORT_FORMATS[format])}；单价、总价留空${L.title ? '；第 1 行标题「' + esc(L.title) + '」' : ''}）</div>
+  <div class="section">预览（月度课时统计表，和原「课时统计」Sheet1 同格式；单价、总价留空）</div>
   <div class="tbl-wrap"><table id="export-preview"><thead><tr>${cols.map((i) => `<th>${esc(aoa[0][i])}</th>`).join('')}</tr></thead><tbody>
   ${aoa.slice(1).map((r) => `<tr>${cols.map((i) => `<td>${esc(r[i])}</td>`).join('')}</tr>`).join('') || '<tr><td colspan="6">这个月没有签课</td></tr>'}</tbody></table></div>
-  </div><div class="fab-wrap"><button class="btn primary big" id="btn-export" data-act="do-export" ${stats.sessions.length ? '' : 'disabled'}>导出 Excel${issues.length ? `（有 ${issues.length} 条提醒）` : ''}</button></div>`;
+  </div><div class="fab-wrap"><button class="btn primary big" id="btn-export" data-act="do-export" ${stats.sessions.length ? '' : 'disabled'}>${EXPORT_LABEL}${issues.length ? `（有 ${issues.length} 条提醒）` : ''}</button></div>`;
 };
 const prevMonthDefault = () => (new Date().getDate() <= 10 ? prevMonth() : thisMonth());
 async function doExport() {
-  const month = S.view.month ?? prevMonthDefault(), campus = S.view.campus ?? '', format = S.view.format ?? st().settings.exportFormat ?? 'weiduo';
+  const month = S.view.month ?? prevMonthDefault(), campus = S.view.campus ?? '';
   const { from, to } = monthRange(month);
   const { issues, stats } = precheck(st(), { from, to, campus });
   if (issues.length && !(await confirmDlg(`自检有 ${issues.length} 条提醒`, issues.slice(0, 6).map((i) => `· ${i.where}：${i.text}`).join('\n') + (issues.length > 6 ? '\n……' : '') + '\n\n建议先点开逐条核对。仍要导出吗？', '仍导出'))) return;
   const org = st().settings.org ?? '';
-  const name = format === 'jing' ? `${org}${campus}${month.replace('-', '')}课时费表.xlsx` : `${org}${campus}${month.slice(0, 4)}年${+month.slice(5)}月课时统计.xlsx`;
-  await saveFile(writeMonthlyWorkbook(XLSX, st(), stats, { format }), name, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  const name = monthlyFileName(org, campus, month);
+  await saveFile(writeMonthlyWorkbook(XLSX, st(), stats, { format: 'weiduo' }), name, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   if (!S.store.isLocked(month)) { S.store.lockMonth(month, '导出课时统计表后自动锁定'); await flush(); toast(`已导出，${+month.slice(5)}月已锁账`); }
   else toast('已导出');
   render();
@@ -363,8 +378,8 @@ async function doExport() {
 VIEWS.backup = () => `${top('备份与恢复', { back: 'menu' })}<div class="page" id="backup">
   <div class="card"><b>一键备份</b><p class="hint">数据只在这台手机里。删除主屏图标、清除 Safari 数据或换手机都会丢数据。每周至少备份一次，存到「文件」→ iCloud 云盘，或发给自己的微信。</p>
   <button class="btn primary" id="btn-backup" data-act="backup">导出完整备份（JSON）</button>
-  <button class="btn" data-act="backup-xlsx">另存一份全部数据 Excel（给人看）</button>
-  <p class="hint">${S.lastExport ? '上次备份：' + fmtTime(S.lastExport) : '还没备份过'}</p></div>
+  <p class="hint">${S.lastExport ? '上次备份：' + fmtTime(S.lastExport) : '还没备份过'}</p>
+  <p class="hint">月度课时统计表在 菜单 →「${EXPORT_LABEL}」。给人查看的明细 Excel 在 设置 →「${DATA_XLSX_LABEL}」。</p></div>
   <div class="card"><b>恢复</b><p class="hint">选之前导出的 .json 备份文件。恢复会用备份<b>替换</b>手机上现有的全部数据（替换前会自动在本机留一份快照）。</p>
   <label class="btn danger" id="lbl-restore">从备份恢复<input type="file" id="f-restore" accept=".json,application/json" class="hidden"></label></div>
   <div class="section">本机自动快照（换手机无效，仅防误操作）</div><div class="list" id="snaps"><div class="empty">读取中…</div></div></div>`;
@@ -425,6 +440,8 @@ VIEWS.settings = () => {
   <button class="row" data-act="set-campus"><div class="main"><div class="t">本机默认校区</div><div class="s">${esc(st().settings.campus || '未设置')}（新建课程时自动带入）</div></div></button>
   <button class="row" data-act="set-org"><div class="main"><div class="t">机构名称（导出文件名前缀）</div><div class="s">${esc(st().settings.org || '未设置')}，例如填「维多」导出为「维多2026年11月课时统计.xlsx」</div></div></button>
   <button class="row" data-act="change-pin"><div class="main"><div class="t">修改密码</div></div></button></div>
+  <div class="section">数据备份</div><div class="list">
+  <button class="row" id="btn-data-xlsx" data-act="backup-xlsx"><div class="main"><div class="t">${DATA_XLSX_LABEL}</div><div class="s wrap">学生名单、课程、签课明细三页，只给人查看；<b>不是</b>月度课时统计表（那个在 菜单 →「${EXPORT_LABEL}」）。换手机恢复请用「备份与恢复」里的 JSON 完整备份。</div></div><span class="chev">›</span></button></div>
   <div class="section">已锁账的月份</div><div class="list">${lm.map((m) => `<div class="row"><div class="main"><div class="t">${m}</div></div><button class="btn small" data-act="unlock-month" data-m="${m}">解锁</button></div>`).join('') || '<div class="empty">暂无</div>'}</div>
   <p class="hint">存储永久保留：${S.persisted === true ? '已获准' : S.persisted === false ? '未获准（请定期备份）' : '未知'}。页面禁止任何外部连接，数据不离开手机。</p></div>`;
 };
@@ -435,9 +452,9 @@ VIEWS.help = () => `${top('使用教程', { back: S.unlocked ? 'menu' : 'home' }
   <h3>3. 建课程模板（每个班建一次）</h3><p>菜单 →「课程模板」→「新建」：年级 高二、班课、科目 数学、教师、课程名称「高二数学班」、默认 1 节 → 勾选学生甲～学生己 6 人 →「保存课程」。一对一每个学生每科建一门。</p>
   <h3>4. 签课</h3><p>首页点「高二数学班」→ 日期默认今天，改成 11月8日 → 默认全部到课，把学生己点成「请假」（没来也没请假的点「缺勤」）→ 底部显示「到课 5 人 · 请假 1 · 共 5 节」→「完成签课」。某人只上半节就点「−」改成 0.5 节（=1课时）。同一个班同一天再签会提醒，防止重复。</p>
   <h3>5. 改错</h3><p>签完就锁定。要改：点那次签课 →「修改（需填原因）」→ 改好后填写原因 → 保存。每次改动都留在「留痕」和「操作记录」里。</p>
-  <h3>6. 月底导出</h3><p>菜单 →「月底导出课时统计表」→ 选月份 → 看「导出前自检」（0 人到课、节数异常、学生不在名单里会逐条列出，点开核对）→「导出 Excel」。表格式与原「课时统计」一样：本例学生甲一行写「1节2课时」，课次写「5人1次」；消课单价、总价留空。导出后该月自动<b>锁账</b>，再改要输密码。</p>
+  <h3>6. 月底导出月度课时统计表</h3><p>菜单（或首页底部）→「<b>导出月度课时统计表</b>」→ 选月份 → 看「导出前自检」（0 人到课、节数异常、学生不在名单里会逐条列出，点开核对）→ 点底部「<b>导出月度课时统计表</b>」→ 存到「文件」或发微信。导出的就是原来的「课时统计」表（只有一页 Sheet1：蓝色表头、合并单元格）：本例学生甲一行写「1节2课时」，课次写「5人1次」；消课单价、总价留空。导出后该月自动<b>锁账</b>，再改要输密码。</p>
   <h3>V2 新功能</h3><p><b>补课/调课</b>：签课页「这次课的标记」点「补课」或「调课」，导出时备注写「补课1次」。<b>代课</b>：签课页把「授课老师」改成代课老师，导出时这次课时记在代课老师名下，备注写原任课老师。<b>按老师查课时</b>、<b>按学生查次数</b>：菜单里选月份查看，点开看明细。<b>连续缺课提醒</b>：同一门课连续 2 次请假或缺勤，首页和学生查询里标红。</p>
-  <h3>7. 备份（每周一次）</h3><p>菜单 →「备份与恢复」→「导出完整备份」→ 存到「文件」→ iCloud 云盘，或发给自己的微信。换手机时在新手机上「从备份恢复」。不要删除桌面图标、不要清除 Safari 数据。</p>
+  <h3>7. 备份（每周一次）</h3><p>菜单 →「备份与恢复」→「导出完整备份（JSON）」→ 存到「文件」→ iCloud 云盘，或发给自己的微信。换手机时在新手机上「从备份恢复」。不要删除桌面图标、不要清除 Safari 数据。另有「设置 → <b>数据备份（非统计表）</b>」可导出学生名单/课程/签课明细三页 Excel 给人查看，它<b>不是</b>课时统计表，月底交表请用第 6 步。</p>
   <p class="hint">数据只存在这台手机，不上传，不同步到别的手机。</p></div>`;
 
 // ---------- 文件保存（iPhone 走分享面板，可存到「文件」或发微信） ----------
@@ -515,7 +532,7 @@ document.addEventListener('click', async (e) => {
       case 'undo-import': { if (!(await confirmDlg('撤销整批导入？', '这次导入新增的学生会删除，更新的恢复原样。', '整批撤销', true))) return; S.store.undo(id); await flush(); toast('已撤销'); return render(); }
       case 'do-export': return doExport();
       case 'backup': return doBackup();
-      case 'backup-xlsx': return saveFile(writeAllDataWorkbook(XLSX, st()), `签课全部数据-${dayOf(new Date())}.xlsx`, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      case 'backup-xlsx': return saveFile(writeAllDataWorkbook(XLSX, st()), dataBackupFileName(dayOf(new Date())), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
       case 'restore-snap': {
         const s = await db.getSnapshot(id);
         if (!(await confirmDlg('恢复到这份快照？', `${s.reason} ${fmtTime(s.createdAt)}，当前数据会先自动留一份快照。`, '恢复', true))) return;
@@ -548,9 +565,8 @@ document.addEventListener('change', (e) => {
   else if (t.id === 'f-restore' && t.files?.[0]) onRestoreFile(t.files[0]);
   else if (t.id === 's-month' && t.value) go('sessions', { month: t.value });
   else if (t.id === 'q-month' && t.value) go(t.dataset.v, { month: t.value });
-  else if (t.id === 'e-month' && t.value) go('export', { month: t.value, campus: S.view.campus ?? '', format: S.view.format });
-  else if (t.id === 'e-campus') go('export', { month: S.view.month ?? prevMonthDefault(), campus: t.value, format: S.view.format });
-  else if (t.id === 'e-format') { if (st().settings.exportFormat !== t.value) S.store.setSettings({ exportFormat: t.value }); go('export', { month: S.view.month ?? prevMonthDefault(), campus: S.view.campus ?? '', format: t.value }); }
+  else if (t.id === 'e-month' && t.value) go('export', { month: t.value, campus: S.view.campus ?? '' });
+  else if (t.id === 'e-campus') go('export', { month: S.view.month ?? prevMonthDefault(), campus: t.value });
   else if (t.id === 'r-date' && S.draft) { S.draft.date = t.value; keepRoll(); }
   else if (t.matches?.('#c-mode button')) {}
 });

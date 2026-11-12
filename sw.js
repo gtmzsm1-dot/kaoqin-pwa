@@ -1,5 +1,5 @@
 // Service Worker：缓存全部页面文件，断网可用；不向任何外部地址发请求
-const VERSION = 'v2.0.0-1';
+const VERSION = 'v2.0.1-1';
 const CACHE = 'kaoqin-' + VERSION;
 const FILES = [
   './', './index.html', './styles.css', './manifest.webmanifest',
@@ -11,8 +11,14 @@ self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FILES.map((f) => new Request(f, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', (e) => {
-  e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k.startsWith('kaoqin-') && k !== CACHE).map((k) => caches.delete(k))))
-    .then(() => self.clients.claim()));
+  // 升级（本机有旧版缓存）时：接管后把已打开的页面刷新一次，让「关掉重开」一次就用上新版本
+  e.waitUntil(caches.keys().then(async (keys) => {
+    const old = keys.filter((k) => k.startsWith('kaoqin-') && k !== CACHE);
+    await Promise.all(old.map((k) => caches.delete(k)));
+    await self.clients.claim();
+    // 不能在 waitUntil 里等 navigate（导航要等 SW 激活完成，会互相等死）
+    if (old.length) self.clients.matchAll({ type: 'window' }).then((cs) => cs.forEach((c) => c.navigate(c.url).catch(() => {})));
+  }));
 });
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);

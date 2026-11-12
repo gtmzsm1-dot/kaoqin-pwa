@@ -1,6 +1,7 @@
 // 页面层：只调用 core 的公开 API；所有数据只存在本机 IndexedDB，不连任何外部地址
 import * as XLSX from '../vendor/xlsx.mjs';
-import { Store, ATT, MODES, STATUS_LIST, KIND_LABEL, courseLabel, presentCount, totalJie } from './core/store.js';
+import { Store, ATT, MODES, STATUS_LIST, KIND_LABEL, courseLabel, presentCount, totalJie, migrate, SESSION_TAGS, sessionTeacher } from './core/store.js';
+import { teacherSummary, studentSummary, absenceStreaks, streakKey } from './core/query.js';
 import { readRosterSheet, planImport, writeRosterTemplate } from './core/roster.js';
 import { buildStats, layoutSheet, writeMonthlyWorkbook, writeAllDataWorkbook, precheck, consumeLabel, EXPORT_FORMATS } from './core/export.js';
 import { makeBackup, readBackup } from './core/backup.js';
@@ -11,7 +12,7 @@ import * as db from './db.js';
 import { makePinRecord, checkPin, isValidPin } from './pin.js';
 import { esc, sheet, confirmDlg, alertDlg, promptDlg, toast, pinPad, askPin } from './ui.js';
 
-export const APP_VERSION = '1.0.2';
+export const APP_VERSION = '2.0.0';
 const AUTO_LOCK_MS = 3 * 60 * 1000;
 const XLSX_ACCEPT = '.xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel';
 const $app = document.getElementById('app');
@@ -34,9 +35,14 @@ async function boot() {
     if (S.persisted === false && navigator.storage?.persist) S.persisted = await navigator.storage.persist(); } catch { S.persisted = null; }
   S.lastExport = await db.kvGet('lastBackup').catch(() => null);
   const rec = await db.loadData();
+  if (rec && (rec.state.schema ?? 1) < 2) {
+    // V1 → V2 升级：先把原样数据存一份快照，再补齐新字段（不删改已有数据）
+    await db.addSnapshot('升级 V2 前自动快照', rec.state, rec.ops);
+    migrate(rec.state);
+    await db.saveData(rec.state, rec.ops);
+  } else if (rec) migrate(rec.state);
   S.store = rec ? new Store({ state: rec.state, ops: rec.ops }) : new Store();
   if (!rec) await db.saveData(S.store.state, S.store.ops);
-  S.store.state.settings.lockedMonths ??= [];
   attach();
   S.integrity = S.store.verifyIntegrity();
   const snaps = await db.listSnapshots();
@@ -114,19 +120,27 @@ VIEWS.home = () => {
   return `${top('签课', { right: '<button class="iconbtn" id="btn-menu" data-go="menu">菜单</button>' })}${banners}
   <div class="page">
     ${!Object.keys(st().students).length ? `<div class="card"><b>第一步：导入学生名单</b><p class="hint">把「学生总名单」Excel 通过微信或 AirDrop 存到「文件」，再从这里导入。</p><button class="btn primary" data-go="import">导入名单</button><button class="btn ghost" data-go="help">看使用教程</button></div>` : ''}
+    ${streakHtml()}
     <div class="section">课程（点一下就签课）</div>${list}
     <div class="section">今天已签 ${todayS.length} 次</div>
     ${todayS.length ? `<div class="list">${todayS.map(sessRow).join('')}</div>` : '<div class="empty">今天还没签课</div>'}
   </div>
   <div class="fab-wrap"><button class="btn primary big" id="btn-roll" data-act="pick-course">签课</button></div>`;
 };
+function streakHtml() {
+  const list = absenceStreaks(st());
+  if (!list.length) return '';
+  return `<div class="section err-text">连续缺课提醒（同一门课连续 2 次及以上请假/缺勤）</div><div class="list" id="streaks">${list.slice(0, 20).map((x) => `<button class="row err" data-go="byStudent" data-id="${x.studentId}"><div class="main"><div class="t">${esc(x.name)} · 连续 ${x.streak} 次</div><div class="s">${esc(x.course)} · ${esc(x.dates.slice(-3).join('、'))}</div></div><span class="chev">›</span></button>`).join('')}</div>`;
+}
+const tagText = (s) => (s.tag ? ` · ${s.tag}` : '') + (s.subTeacher ? ` · 代课：${s.subTeacher}` : '');
 const sessRow = (s) => `<button class="row" data-go="session" data-id="${s.id}"><div class="main"><div class="t">${esc(courseLabel(st().courses[s.courseId]))}</div>
-  <div class="s">${fmtDay(s.date)} · 到课 ${presentCount(s)} 人${leaveAbsText(s)} · 共 ${fmtNum(totalJie(s))} 节${s.edits ? ` · 改过 ${s.edits} 次` : ''}</div></div>${S.store.isLocked(s.date.slice(0, 7)) ? '<span class="tag">已锁账</span>' : '<span class="tag">已签</span>'}</button>`;
+  <div class="s">${fmtDay(s.date)} · 到课 ${presentCount(s)} 人${leaveAbsText(s)} · 共 ${fmtNum(totalJie(s))} 节${esc(tagText(s))}${s.edits ? ` · 改过 ${s.edits} 次` : ''}</div></div>${S.store.isLocked(s.date.slice(0, 7)) ? '<span class="tag">已锁账</span>' : '<span class="tag">已签</span>'}</button>`;
 const leaveAbsText = (s) => { const l = s.records.filter((r) => r.status === ATT.leave).length, a = s.records.filter((r) => r.status === ATT.absent).length; return (l ? ` · 请假 ${l}` : '') + (a ? ` · 缺勤 ${a}` : ''); };
 
 // ---------- 菜单 ----------
 VIEWS.menu = () => `${top('菜单', { back: 'home' })}<div class="page"><div class="list menu">
   ${[['sessions', '签课记录', '按月份查看、修改'], ['students', '学生名单', `${S.store.students().length} 人在读`], ['import', '导入名单', '从 Excel 导入或合并'], ['courses', '课程模板', `${S.store.courses().length} 门`],
+    ['byTeacher', '按老师查课时', '本月每位老师上了多少节'], ['byStudent', '按学生查次数', '到课、请假、缺勤次数'],
     ['export', '月底导出课时统计表', '导出前自检，导出后锁账'], ['backup', '备份与恢复', S.lastExport ? '上次备份 ' + fmtTime(S.lastExport) : '还没备份过'], ['log', '操作记录', `${S.store.ops.length} 条`],
     ['help', '使用教程', '一页看懂'], ['settings', '设置', '校区、密码、锁账月份']]
     .map(([v, t, s]) => `<button class="row" data-go="${v}" id="m-${v}"><div class="main"><div class="t">${t}</div><div class="s">${esc(s)}</div></div><span class="chev">›</span></button>`).join('')}
@@ -174,7 +188,7 @@ function readCourseForm() {
 
 // ---------- 签课 ----------
 function newRollDraft(course, date = today()) {
-  return { courseId: course.id, date, note: '', editId: null,
+  return { courseId: course.id, date, note: '', editId: null, tag: '', subTeacher: '',
     records: course.studentIds.filter((id) => st().students[id]).map((studentId) => ({ studentId, status: ATT.present, jie: course.defaultJie })) };
 }
 VIEWS.roll = () => {
@@ -193,16 +207,18 @@ VIEWS.roll = () => {
     <div class="stepper ${r.status !== ATT.present ? 'hidden' : ''}"><button data-act="jie" data-i="${i}" data-d="-0.5">−</button><span class="num">${fmtNum(r.jie)}</span><button data-act="jie" data-i="${i}" data-d="0.5">＋</button></div>
   </div>`).join('') || '<div class="empty">这门课程还没有学生，请到「课程模板」里添加</div>'}</div>
   <p class="hint">只能签课程里的学生。要加人，请到「课程模板」从总名单里选。</p>
-  <label class="field"><span>备注（可不填）</span><input class="input" id="r-note" value="${esc(d.note)}" placeholder="如 调课、补课"></label>
+  <div class="field"><span class="lbl">这次课的标记</span><div class="seg3" id="r-tag">${SESSION_TAGS.map((t) => `<button data-act="set-tag" data-t="${t}" class="${(d.tag ?? '') === t ? 'on' : ''}">${t || '正常上课'}</button>`).join('')}</div></div>
+  <label class="field"><span>授课老师（代课时改成代课老师；导出时课时记在他名下）</span><input class="input" id="r-sub" value="${esc(d.subTeacher || c.teacher)}" placeholder="${esc(c.teacher)}"></label>
+  <label class="field"><span>备注（可不填）</span><input class="input" id="r-note" value="${esc(d.note)}" placeholder="如 调到周六上"></label>
   </div><div class="fab-wrap"><div class="sum" id="roll-sum">到课 ${n} 人 · 请假 ${d.records.filter((r) => r.status === ATT.leave).length} · 缺勤 ${d.records.filter((r) => r.status === ATT.absent).length} · 共 ${fmtNum(sum)} 节</div>
   <button class="btn primary big" id="btn-save-roll" data-act="save-roll">${d.editId ? '保存修改' : '完成签课'}</button></div>`;
 };
 async function saveRoll() {
   const d = S.draft;
-  d.date = document.getElementById('r-date').value; d.note = document.getElementById('r-note').value;
+  d.date = document.getElementById('r-date').value; d.note = document.getElementById('r-note').value; d.subTeacher = document.getElementById('r-sub').value.trim();
   if (!isDay(d.date)) return alertDlg('日期不对', '请选择上课日期');
   if (!d.records.some((r) => r.status === ATT.present) && !(await confirmDlg('没有人到课', '这次课全部请假或缺勤，确定保存吗？', '仍保存'))) return;
-  const input = { courseId: d.courseId, date: d.date, records: d.records, note: d.note };
+  const input = { courseId: d.courseId, date: d.date, records: d.records, note: d.note, tag: d.tag ?? '', subTeacher: d.subTeacher === st().courses[d.courseId].teacher ? '' : d.subTeacher };
   let pinOk = false;
   const needPin = S.store.isLocked(d.date.slice(0, 7)) || (d.editId && S.store.isLocked(st().sessions[d.editId].date.slice(0, 7)));
   if (needPin) { if (!(await pinCheck('该月已锁账，输入密码继续'))) return; pinOk = true; }
@@ -232,7 +248,7 @@ VIEWS.session = ({ id }) => {
   const c = st().courses[s.courseId];
   const hist = S.store.historyOf(id).slice().reverse();
   return `${top('签课详情', { back: 'home' })}<div class="page" id="session">
-  <div class="card"><div class="t-strong">${esc(courseLabel(c))}</div><div class="hint">${fmtDay(s.date)} · 🔒 已签完锁定${S.store.isLocked(s.date.slice(0, 7)) ? ' · 本月已锁账' : ''}</div>
+  <div class="card"><div class="t-strong">${esc(courseLabel(c))}</div><div class="hint">${fmtDay(s.date)}${esc(tagText(s))} · 🔒 已签完锁定${S.store.isLocked(s.date.slice(0, 7)) ? ' · 本月已锁账' : ''}</div>
   <div class="grid3"><div><div class="k">到课</div><div class="v">${presentCount(s)} 人</div></div><div><div class="k">请假/缺勤</div><div class="v">${s.records.filter((r) => r.status === ATT.leave).length} / ${s.records.filter((r) => r.status === ATT.absent).length}</div></div><div><div class="k">合计</div><div class="v">${fmtJie(totalJie(s))}</div></div></div></div>
   <div class="list">${s.records.map((r) => `<div class="row ${r.status !== ATT.present ? 'off' : ''}"><div class="main"><div class="t">${esc(stuName(r.studentId))}</div></div><span>${r.status === ATT.present ? fmtJie(r.jie) : r.status}</span></div>`).join('')}</div>
   ${s.note ? `<p class="hint">备注：${esc(s.note)}</p>` : ''}
@@ -365,7 +381,7 @@ async function doBackup() {
 }
 async function replaceAll(state, ops, label) {
   await db.addSnapshot('恢复前自动快照', S.store.state, S.store.ops);
-  S.store = new Store({ state, ops }); S.store.state.settings.lockedMonths ??= []; attach();
+  migrate(state); S.store = new Store({ state, ops }); attach();
   await db.saveData(state, ops); S.integrity = S.store.verifyIntegrity();
   toast(label); go('home');
 }
@@ -378,6 +394,28 @@ async function onRestoreFile(file) {
     await replaceAll(state, ops, '已从备份恢复');
   } catch (e) { alertDlg('恢复失败', e.message); }
 }
+
+// ---------- V2 查询 ----------
+VIEWS.byTeacher = ({ month = thisMonth(), id = '' }) => {
+  const { from, to } = monthRange(month);
+  const list = teacherSummary(st(), { from, to });
+  return `${top('按老师查课时', { back: 'menu' })}<div class="page" id="by-teacher"><label class="field"><span>月份</span><input class="input" type="month" id="q-month" data-v="byTeacher" value="${month}"></label>
+  <p class="hint">授课节数：每次课按这次课的节数计；学生消课：到课学生节数之和。代课的课时算代课老师。</p>
+  ${list.length ? list.map((x) => `<div class="card"><button class="row plain" data-act="q-open" data-k="${esc(x.teacher)}"><div class="main"><div class="t-strong">${esc(x.teacher)}</div>
+    <div class="s">上课 ${x.sessions} 次 · 授课 ${fmtJie(x.teachJie)} · 学生消课 ${fmtJie(x.studentJie)}${x.substitute ? ` · 其中代课 ${x.substitute} 次` : ''}</div></div><span class="chev">${S.qOpen === x.teacher ? '收起' : '明细'}</span></button>
+    ${S.qOpen === x.teacher ? `<div class="list">${x.items.map((i) => `<button class="row" data-go="session" data-id="${i.sessionId}"><div class="main"><div class="t">${fmtDay(i.date)} ${esc(i.course)}</div><div class="s">到课 ${i.present} 人 · ${fmtJie(i.teachJie)}${i.tag ? ' · ' + i.tag : ''}${i.substitute ? ' · 代课' : ''}</div></div></button>`).join('')}</div>` : ''}</div>`).join('') : '<div class="empty">这个月没有签课</div>'}</div>`;
+};
+VIEWS.byStudent = ({ month = thisMonth(), id = '' }) => {
+  const { from, to } = monthRange(month);
+  const list = studentSummary(st(), { from, to });
+  const red = new Set(absenceStreaks(st()).map((x) => x.studentId));
+  const open = id || S.qOpenStu;
+  return `${top('按学生查次数', { back: 'menu' })}<div class="page" id="by-student"><label class="field"><span>月份</span><input class="input" type="month" id="q-month" data-v="byStudent" value="${month}"></label>
+  <p class="hint">红色：同一门课连续 2 次及以上请假或缺勤。</p>
+  ${list.length ? `<div class="list">${list.map((x) => `<button class="row ${red.has(x.studentId) ? 'err' : ''}" data-act="q-open-stu" data-k="${x.studentId}"><div class="main"><div class="t">${esc(x.name)}</div>
+    <div class="s">到课 ${x.present} 次（${fmtJie(x.jie)}）· 请假 ${x.leave} 次 · 缺勤 ${x.absent} 次</div></div><span class="chev">${open === x.studentId ? '收起' : '明细'}</span></button>
+    ${open === x.studentId ? x.items.map((i) => `<button class="row sub" data-go="session" data-id="${i.sessionId}"><div class="main"><div class="t">${fmtDay(i.date)} ${esc(i.course)}</div><div class="s">${i.status === ATT.present ? fmtJie(i.jie) : i.status}${i.tag ? ' · ' + i.tag : ''}</div></div></button>`).join('') : ''}`).join('')}</div>` : '<div class="empty">这个月没有签课</div>'}</div>`;
+};
 
 // ---------- 操作记录 / 设置 / 教程 ----------
 VIEWS.log = () => `${top('操作记录', { back: 'menu' })}<div class="page"><p class="hint">所有改动都在这里，最新的在上面。</p><div class="list">${[...S.store.ops].reverse().slice(0, 500).map((o) => `<div class="row"><div class="main"><div class="t wrap">${esc(o.summary)}</div><div class="s">${fmtTime(o.at)} · ${esc(KIND_LABEL[o.kind] ?? o.kind)}</div></div></div>`).join('') || '<div class="empty">暂无</div>'}</div></div>`;
@@ -398,6 +436,7 @@ VIEWS.help = () => `${top('使用教程', { back: S.unlocked ? 'menu' : 'home' }
   <h3>4. 签课</h3><p>首页点「高二数学班」→ 日期默认今天，改成 11月8日 → 默认全部到课，把学生己点成「请假」（没来也没请假的点「缺勤」）→ 底部显示「到课 5 人 · 请假 1 · 共 5 节」→「完成签课」。某人只上半节就点「−」改成 0.5 节（=1课时）。同一个班同一天再签会提醒，防止重复。</p>
   <h3>5. 改错</h3><p>签完就锁定。要改：点那次签课 →「修改（需填原因）」→ 改好后填写原因 → 保存。每次改动都留在「留痕」和「操作记录」里。</p>
   <h3>6. 月底导出</h3><p>菜单 →「月底导出课时统计表」→ 选月份 → 看「导出前自检」（0 人到课、节数异常、学生不在名单里会逐条列出，点开核对）→「导出 Excel」。表格式与原「课时统计」一样：本例学生甲一行写「1节2课时」，课次写「5人1次」；消课单价、总价留空。导出后该月自动<b>锁账</b>，再改要输密码。</p>
+  <h3>V2 新功能</h3><p><b>补课/调课</b>：签课页「这次课的标记」点「补课」或「调课」，导出时备注写「补课1次」。<b>代课</b>：签课页把「授课老师」改成代课老师，导出时这次课时记在代课老师名下，备注写原任课老师。<b>按老师查课时</b>、<b>按学生查次数</b>：菜单里选月份查看，点开看明细。<b>连续缺课提醒</b>：同一门课连续 2 次请假或缺勤，首页和学生查询里标红。</p>
   <h3>7. 备份（每周一次）</h3><p>菜单 →「备份与恢复」→「导出完整备份」→ 存到「文件」→ iCloud 云盘，或发给自己的微信。换手机时在新手机上「从备份恢复」。不要删除桌面图标、不要清除 Safari 数据。</p>
   <p class="hint">数据只存在这台手机，不上传，不同步到别的手机。</p></div>`;
 
@@ -432,7 +471,8 @@ document.addEventListener('click', async (e) => {
       case 'set-status': { const r = S.draft.records[+b.dataset.i]; r.status = b.dataset.s; if (r.status === ATT.present && !r.jie) r.jie = st().courses[S.draft.courseId].defaultJie; return keepRoll(); }
       case 'jie': { const r = S.draft.records[+b.dataset.i]; const n = Math.round((r.jie + Number(b.dataset.d)) * 2) / 2; if (n >= 0.5 && n <= 10) r.jie = n; return keepRoll(); }
       case 'save-roll': return saveRoll();
-      case 'edit-session': { const s = st().sessions[id]; S.draft = { courseId: s.courseId, date: s.date, note: s.note ?? '', editId: id, records: s.records.map((r) => ({ ...r, jie: r.status === ATT.present ? r.jie : st().courses[s.courseId]?.defaultJie ?? 1 })) }; return go('roll'); }
+      case 'set-tag': S.draft.tag = b.dataset.t; return keepRoll();
+      case 'edit-session': { const s = st().sessions[id]; S.draft = { courseId: s.courseId, date: s.date, note: s.note ?? '', editId: id, tag: s.tag ?? '', subTeacher: s.subTeacher ?? '', records: s.records.map((r) => ({ ...r, jie: r.status === ATT.present ? r.jie : st().courses[s.courseId]?.defaultJie ?? 1 })) }; return go('roll'); }
       case 'del-session': {
         const s = st().sessions[id];
         let pinOk = false;
@@ -483,6 +523,8 @@ document.addEventListener('click', async (e) => {
         return replaceAll(s.state, s.ops, '已恢复到快照');
       }
       case 'set-campus': { const v = await promptDlg('本机默认校区', { value: st().settings.campus ?? '' }); if (v == null) return; S.store.setSettings({ campus: v.trim() }); await flush(); return render(); }
+      case 'q-open': S.qOpen = S.qOpen === b.dataset.k ? null : b.dataset.k; return keepScroll();
+      case 'q-open-stu': S.qOpenStu = S.qOpenStu === b.dataset.k ? null : b.dataset.k; S.view.id = ''; return keepScroll();
       case 'set-org': { const v = await promptDlg('机构名称', { value: st().settings.org ?? '' }); if (v == null) return; S.store.setSettings({ org: v.trim() }); await flush(); return render(); }
       case 'unlock-month': { if (!(await pinCheck(`解锁 ${b.dataset.m}`))) return; S.store.unlockMonth(b.dataset.m); await flush(); toast('已解锁'); return render(); }
       case 'change-pin': {
@@ -499,12 +541,13 @@ document.addEventListener('click', async (e) => {
   }
 });
 function keepScroll() { const y = window.scrollY; render(); window.scrollTo(0, y); }
-function keepRoll() { const d = document.getElementById('r-date'); if (d) S.draft.date = d.value; const n = document.getElementById('r-note'); if (n) S.draft.note = n.value; keepScroll(); }
+function keepRoll() { const d = document.getElementById('r-date'); if (d) S.draft.date = d.value; const n = document.getElementById('r-note'); if (n) S.draft.note = n.value; const t = document.getElementById('r-sub'); if (t) S.draft.subTeacher = t.value.trim(); keepScroll(); }
 document.addEventListener('change', (e) => {
   const t = e.target;
   if (t.id === 'f-import' && t.files?.[0]) onImportFile(t.files[0]);
   else if (t.id === 'f-restore' && t.files?.[0]) onRestoreFile(t.files[0]);
   else if (t.id === 's-month' && t.value) go('sessions', { month: t.value });
+  else if (t.id === 'q-month' && t.value) go(t.dataset.v, { month: t.value });
   else if (t.id === 'e-month' && t.value) go('export', { month: t.value, campus: S.view.campus ?? '', format: S.view.format });
   else if (t.id === 'e-campus') go('export', { month: S.view.month ?? prevMonthDefault(), campus: t.value, format: S.view.format });
   else if (t.id === 'e-format') { if (st().settings.exportFormat !== t.value) S.store.setSettings({ exportFormat: t.value }); go('export', { month: S.view.month ?? prevMonthDefault(), campus: S.view.campus ?? '', format: t.value }); }

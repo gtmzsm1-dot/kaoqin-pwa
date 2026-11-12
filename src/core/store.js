@@ -12,7 +12,9 @@ export const KIND_LABEL = {
   lockMonth: '锁定月份', unlockMonth: '解锁月份',
 };
 const COLLS = ['students', 'courses', 'sessions'];
-export const emptyState = () => ({ schema: 1, students: {}, courses: {}, sessions: {}, settings: { campus: '', lockedMonths: [] } });
+export const SCHEMA = 2;
+export const SESSION_TAGS = ['', '补课', '调课'];
+export const emptyState = () => ({ schema: SCHEMA, students: {}, courses: {}, sessions: {}, settings: { campus: '', lockedMonths: [] } });
 
 const defaultUuid = () => globalThis.crypto.randomUUID();
 export const isPendingCode = (c) => !c || /^待补/.test(String(c).trim());
@@ -125,7 +127,7 @@ export class Store {
     const date = input.date ?? prev?.date;
     if (!isDay(date)) throw new Error('日期不对');
     const seen = new Set();
-    const records = (input.records ?? []).map((r) => {
+    const records = (input.records ?? prev?.records ?? []).map((r) => {
       if (!this.state.students[r.studentId]) throw new Error('签课里有不存在的学生');
       if (seen.has(r.studentId)) throw new Error('同一学生重复'); seen.add(r.studentId);
       const status = Object.values(ATT).includes(r.status) ? r.status : ATT.present;
@@ -135,7 +137,11 @@ export class Store {
       return { studentId: r.studentId, status, jie };
     });
     if (!records.length) throw new Error('没有学生');
-    return { ...(prev ?? {}), courseId, date, records, note: String(input.note ?? prev?.note ?? '').trim() };
+    const tag = input.tag ?? prev?.tag ?? '';
+    if (!SESSION_TAGS.includes(tag)) throw new Error('标记只能是 补课 或 调课');
+    let subTeacher = String(input.subTeacher ?? prev?.subTeacher ?? '').trim();
+    if (subTeacher === course.teacher) subTeacher = '';
+    return { ...(prev ?? {}), courseId, date, records, note: String(input.note ?? prev?.note ?? '').trim(), tag, subTeacher };
   }
   // ---------- 月度锁账 ----------
   isLocked(month) { return (this.state.settings.lockedMonths ?? []).includes(month); }
@@ -154,7 +160,7 @@ export class Store {
   addSession(input, { pinOk = false } = {}) {
     this.guardMonth(input.date, pinOk);
     const s = this.normSession(input); s.id = this.uuid(); s.createdAt = this.stamp(); s.updatedAt = s.createdAt;
-    this.commit('addSession', `签课 ${s.date} ${courseLabel(this.state.courses[s.courseId])}：到课 ${presentCount(s)} 人`, [{ coll: 'sessions', id: s.id, after: s }]);
+    this.commit('addSession', `签课 ${s.date} ${courseLabel(this.state.courses[s.courseId])}${s.tag ? '（' + s.tag + '）' : ''}${s.subTeacher ? '（代课：' + s.subTeacher + '）' : ''}：到课 ${presentCount(s)} 人`, [{ coll: 'sessions', id: s.id, after: s }]);
     return s;
   }
   /** 签完即锁定：修改必须填原因，原因与改动写进操作记录 */
@@ -228,9 +234,24 @@ export function courseLabel(c) {
   if (!c) return '（已删除课程）';
   return c.name || [c.campus, c.grade, c.subject, c.mode, c.teacher].filter(Boolean).join(' · ');
 }
+/** V1 数据（schema 1）升级到 V2：补齐新字段，不删除、不改动任何已有数据 */
+export function migrate(state) {
+  if (!state || typeof state !== 'object') throw new Error('数据格式不对');
+  const from = state.schema ?? 1;
+  if (from > SCHEMA) throw new Error('数据来自更新的版本，请先更新 App');
+  state.settings ??= { campus: '' };
+  state.settings.lockedMonths ??= [];
+  for (const k of ['students', 'courses', 'sessions']) state[k] ??= {};
+  for (const s of Object.values(state.sessions)) { s.tag ??= ''; s.subTeacher ??= ''; }
+  state.schema = SCHEMA;
+  return { from, to: SCHEMA, changed: from !== SCHEMA };
+}
+export const sessionTeacher = (state, s) => s.subTeacher || state.courses[s.courseId]?.teacher || '';
 function diffText(store, a, b) {
   const parts = [];
   if (a.date !== b.date) parts.push(`日期 ${a.date}→${b.date}`);
+  if ((a.tag ?? '') !== (b.tag ?? '')) parts.push(`标记 ${a.tag || '正常'}→${b.tag || '正常'}`);
+  if ((a.subTeacher ?? '') !== (b.subTeacher ?? '')) parts.push(`授课老师 ${a.subTeacher || '原任课'}→${b.subTeacher || '原任课'}`);
   const ma = new Map(a.records.map((r) => [r.studentId, r]));
   for (const r of b.records) {
     const o = ma.get(r.studentId); const nm = store.state.students[r.studentId]?.name ?? '?';

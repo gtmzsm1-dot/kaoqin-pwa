@@ -158,3 +158,7 @@ label.btn { text-align: center; }
 .help p { margin: 4px 0; }
 .mt { margin-top: 14px; }
 .spacer { width: 60px; }
+.row.plain { padding: 0; border: 0; }
+.row.sub { padding-left: 28px; }
+.field .lbl { display: block; color: var(--muted); font-size: 13px; margin: 0 0 4px 2px; }
+#r-tag { margin-bottom: 4px; }

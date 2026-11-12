@@ -1,10 +1,10 @@
 // 月度导出：Sheet1 与现有「课时统计」同版式；另附「明细」页（一行 = 一个学生的一次上课，全数值列、不合并）
-import { ATT, courseLabel, STATUS_LIST } from './store.js';
+import { ATT, courseLabel, STATUS_LIST, sessionTeacher } from './store.js';
 import { fmtJie, keshi, roundHalf } from './jie.js';
 import { writeStyledXlsx } from './xlsxw.js';
 
 export const SHEET1_HEADER = (label) => ['教师姓名', '所带学生', '年级', '班型', label, '课次', '消课单价', '消课总价', '课时费单价', '教师课时费', '合计', '备注', '人工核对'];
-export const DETAIL_HEADER = ['日期', '校区', '教师', '年级', '班型', '科目', '课程', '学生', '学生编号', '出勤', '节数', '课时数', '备注'];
+export const DETAIL_HEADER = ['日期', '校区', '教师', '年级', '班型', '科目', '课程', '学生', '学生编号', '出勤', '节数', '课时数', '标记', '原任课教师', '备注'];
 const zh = (a, b) => String(a).localeCompare(String(b), 'zh-CN');
 
 export function consumeLabel(from, to) {
@@ -24,20 +24,27 @@ export function buildStats(state, { from, to, campus = '' }) {
   const sessions = Object.values(state.sessions).filter((s) => s.date >= from && s.date <= to)
     .filter((s) => !campus || (state.courses[s.courseId]?.campus ?? '') === campus)
     .sort((a, b) => a.date.localeCompare(b.date) || a.createdAt.localeCompare(b.createdAt));
-  const byCourse = new Map();
-  for (const s of sessions) { if (!byCourse.has(s.courseId)) byCourse.set(s.courseId, []); byCourse.get(s.courseId).push(s); }
+  // 代课：课时记在这次实际授课的老师名下，所以按「课程 + 授课老师」分组
+  const byKey = new Map();
+  for (const s of sessions) { const k = s.courseId + '|' + sessionTeacher(state, s); if (!byKey.has(k)) byKey.set(k, []); byKey.get(k).push(s); }
   const teachers = new Map();
-  for (const [cid, list] of byCourse) {
+  for (const [key, list] of byKey) {
+    const cid = key.split('|')[0];
     const course = state.courses[cid]; if (!course) continue;
-    const jie = new Map();
-    for (const s of list) for (const r of s.records) if (r.status === ATT.present && r.jie > 0) jie.set(r.studentId, (jie.get(r.studentId) ?? 0) + r.jie);
+    const t = key.slice(cid.length + 1) || '（未填教师）';
+    const jie = new Map(), tags = new Map();
+    for (const s of list) for (const r of s.records) if (r.status === ATT.present && r.jie > 0) {
+      jie.set(r.studentId, (jie.get(r.studentId) ?? 0) + r.jie);
+      if (s.tag) { const m = tags.get(r.studentId) ?? {}; m[s.tag] = (m[s.tag] ?? 0) + 1; tags.set(r.studentId, m); }
+    }
     if (!jie.size) continue;
     const order = [...course.studentIds.filter((id) => jie.has(id)), ...[...jie.keys()].filter((id) => !course.studentIds.includes(id))
       .sort((a, b) => zh(state.students[a]?.name ?? '', state.students[b]?.name ?? ''))];
-    const rows = order.map((id) => ({ student: state.students[id], jie: roundHalf(jie.get(id)) }));
-    const t = course.teacher || '（未填教师）';
+    const sub = t !== course.teacher ? `代课（原任课：${course.teacher}）` : '';
+    const rows = order.map((id) => ({ student: state.students[id], jie: roundHalf(jie.get(id)),
+      note: [sub, ...Object.entries(tags.get(id) ?? {}).map(([k, n]) => `${k}${n}次`)].filter(Boolean).join('；') }));
     if (!teachers.has(t)) teachers.set(t, []);
-    teachers.get(t).push({ course, rows, hist: sessionHistogram(list), sessions: list.length, first: list[0].date + list[0].createdAt });
+    teachers.get(t).push({ course, rows, hist: sessionHistogram(list), sessions: list.length, first: list[0].date + list[0].createdAt, substitute: !!sub });
   }
   const groups = [...teachers.entries()].sort((a, b) => zh(a[0], b[0]))
     .map(([teacher, courses]) => ({ teacher, courses: courses.sort((a, b) => (a.course.mode === '一对一') - (b.course.mode === '一对一') || a.first.localeCompare(b.first) || zh(courseLabel(a.course), courseLabel(b.course))) }));
@@ -51,7 +58,7 @@ export function detailAoa(state, stats) {
     const c = state.courses[s.courseId]; if (!c) continue;
     for (const r of s.records) {
       const st = state.students[r.studentId];
-      aoa.push([s.date, c.campus, c.teacher, c.grade, c.mode, c.subject, courseLabel(c), st?.name ?? '（已删除学生）', st?.code ?? '', r.status, r.jie, keshi(r.jie), s.note ?? '']);
+      aoa.push([s.date, c.campus, sessionTeacher(state, s), c.grade, c.mode, c.subject, courseLabel(c), st?.name ?? '（已删除学生）', st?.code ?? '', r.status, r.jie, keshi(r.jie), s.tag ?? '', s.subTeacher ? c.teacher : '', s.note ?? '']);
     }
   }
   return aoa;
@@ -91,7 +98,7 @@ export function layoutSheet(stats, format = 'weiduo') {
       const cStart = aoa.length;
       c.rows.forEach((r, i) => {
         const base = [aoa.length === tStart ? g.teacher : '', r.student?.name ?? '（已删除学生）', i === 0 ? c.course.grade : '', i === 0 ? c.course.mode : '', fmtJie(r.jie)];
-        aoa.push(jing ? [...base, '', '', c.hist[i] ?? '', '', '', '', '', ''] : [...base, c.hist[i] ?? '', '', '', '', '', '', '', '']);
+        aoa.push(jing ? [...base, '', '', c.hist[i] ?? '', '', '', '', r.note ?? '', ''] : [...base, c.hist[i] ?? '', '', '', '', '', '', r.note ?? '', '']);
       });
       if (c.rows.length > 1) for (const col of [2, 3]) merges.push(encodeMerge(cStart, col, aoa.length - 1, col));
     }
@@ -121,7 +128,7 @@ export function writeMonthlyWorkbook(_XLSX, state, stats, { format = 'weiduo' } 
   const main = { name: L.sheetName, rows, merges: L.merges, cols: cols.map(([min, max, width]) => ({ min, max, width })), heights: jing ? {} : { 1: 17.6 }, defaultRowHeight: 16.8, fitWidth: true };
   const det = detailAoa(state, stats);
   const detRows = det.map((r, ri) => r.map((v, ci) => (ri === 0 ? { v, s: ST.dHead } : ci === 0 ? { v: new Date(v + 'T00:00:00Z'), s: ST.dDate } : { v, s: ST.dCell })));
-  const detail = { name: '明细', rows: detRows, cols: [11, 8, 10, 7, 7, 7, 26, 10, 13, 6, 6, 7, 16].map((w, i) => ({ min: i + 1, max: i + 1, width: w })) };
+  const detail = { name: '明细', rows: detRows, cols: [11, 8, 10, 7, 7, 7, 26, 10, 13, 6, 6, 7, 6, 10, 16].map((w, i) => ({ min: i + 1, max: i + 1, width: w })) };
   return writeStyledXlsx([main, detail]);
 }
 

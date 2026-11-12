@@ -1,11 +1,11 @@
-// IndexedDB：kv（数据、PIN、设置）、snapshots（本机自动快照，保留最近 20 份）
+// IndexedDB（版本 2：V2 不改存储结构，数据字段在 app 启动时迁移）：kv（数据、PIN、设置）、snapshots（本机自动快照，保留最近 20 份）
 const DB_NAME = 'kaoqin-pwa';
 export const SNAPSHOT_KEEP = 20;
 let dbp = null;
 function open() {
   if (dbp) return dbp;
   dbp = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
+    const req = indexedDB.open(DB_NAME, 2);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');

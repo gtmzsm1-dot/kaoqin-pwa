@@ -1,6 +1,6 @@
 // 完整备份：一个 JSON 文件（数据 + 操作记录 + 校验和）；恢复前校验
 import { canonical, sha256Hex } from './util.js';
-import { Store } from './store.js';
+import { Store, migrate } from './store.js';
 
 export const BACKUP_FORMAT = 'kaoqin-pwa-backup';
 export const BACKUP_VERSION = 1;
@@ -21,7 +21,8 @@ export async function readBackup(bytes) {
   if (meta.version > BACKUP_VERSION) throw new Error('备份来自更新的版本，请先更新 App');
   if (!state || !Array.isArray(ops)) throw new Error('备份内容不完整');
   if (await sha256Hex(canonical({ state, ops })) !== meta.checksum) throw new Error('校验和不一致，备份可能已损坏');
+  const mig = migrate(state); // 旧版（V1）备份在校验通过后升级到当前格式
   const issues = new Store({ state, ops }).verifyIntegrity();
   if (issues.length) throw new Error('数据自检失败：' + issues.slice(0, 3).join('；'));
-  return { meta, state, ops };
+  return { meta, state, ops, migrated: mig };
 }
